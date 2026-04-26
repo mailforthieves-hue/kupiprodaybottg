@@ -11,7 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, 
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 
 # --- НАСТРОЙКИ ---
@@ -48,7 +48,6 @@ class AdForm(StatesGroup):
     contact = State()
     photo = State()
     confirm = State() 
-    waiting_for_report_reason = State()
     waiting_for_warn_reason = State()
 
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +64,9 @@ cat_kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="🚗 Авто"), KeyboardButton(text="🏠 Дом/Бизнес")],
     [KeyboardButton(text="👕 Скин/Аксессуар"), KeyboardButton(text="📦 Прочее")]
 ], resize_keyboard=True)
+
+# Кнопка для пропуска фото
+skip_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Без фото")]], resize_keyboard=True)
 
 confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="✅ Отправить", callback_data="final_send")],
@@ -91,13 +93,14 @@ async def process_warn(message: types.Message, state: FSMContext):
     
     if warns >= 3:
         until = time.time() + (30 * 24 * 3600)
-        db_query("UPDATE users SET ban_until = ?, ban_reason = ?, warns = 0 WHERE user_id = ?", (until, f"3/3 варна: {message.text}", t_id), commit=True)
+        db_query("UPDATE users SET ban_until = ?, ban_reason = ?, warns = 0 WHERE user_id = ?", 
+                 (until, f"3/3 варна: {message.text}", t_id), commit=True)
         try: await bot.send_message(t_id, f"🚫 Бан на 30 дней (3/3 варна).\nПричина: {message.text}")
         except: pass
     else:
         try: await bot.send_message(t_id, f"⚠️ Предупреждение ({warns}/3)!\nПричина: {message.text}")
         except: pass
-    await message.answer(f"✅ Готово. У юзера {warns}/3 варна.")
+    await message.answer(f"✅ Готово. У юзера {warns}/3 варна.", reply_markup=main_kb)
     await state.clear()
 
 # --- ОДОБРЕНИЕ ---
@@ -128,77 +131,108 @@ async def profile(message: types.Message):
     u_id = message.from_user.id
     res = db_query("SELECT warns, approved_ads, ban_until FROM users WHERE user_id = ?", (u_id,), fetch=True)
     if not res: 
-        db_query("INSERT INTO users (user_id) VALUES (?)", (u_id,), commit=True)
+        db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (u_id,), commit=True)
         res = [(0,0,0)]
     warns, approved, b_until = res[0]
     status = "🟢 Активен" if b_until < time.time() else "🔴 ЗАБАНЕН"
-    await message.answer(f"👤 <b>ПРОФИЛЬ</b>\n━━━━━━━━━━━━━━━\nID: <code>{u_id}</code>\nСтатус: {status}\nВарны: {warns}/3\nСделок: {approved}", parse_mode="HTML")
+    await message.answer(
+        f"👤 <b>ПРОФИЛЬ</b>\n━━━━━━━━━━━━━━━\nID: <code>{u_id}</code>\nСтатус: {status}\nВарны: {warns}/3\nСделок: {approved}", 
+        parse_mode="HTML", reply_markup=main_kb
+    )
 
 @dp.message(F.text.in_(["💰 Продать", "🛒 Купить"]))
 async def start_ad(message: types.Message, state: FSMContext):
     res = db_query("SELECT ban_until FROM users WHERE user_id = ?", (message.from_user.id,), fetch=True)
-    if res and res[0][0] > time.time(): return await message.answer("🚫 Вы забанены.")
+    if res and res[0][0] > time.time(): 
+        return await message.answer("🚫 Вы забанены.")
     await message.answer("📁 Категория:", reply_markup=cat_kb)
     await state.set_state(AdForm.category)
 
 @dp.message(AdForm.category)
 async def set_cat(message: types.Message, state: FSMContext):
     await state.update_data(category=message.text)
-    await message.answer("📝 Описание:", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer("📝 Описание (Товар, тюнинг):", reply_markup=ReplyKeyboardRemove())
     await state.set_state(AdForm.item)
 
 @dp.message(AdForm.item)
 async def set_item(message: types.Message, state: FSMContext):
-    await state.update_data(item=message.text); await message.answer("💵 Цена:"); await state.set_state(AdForm.price)
+    await state.update_data(item=message.text)
+    await message.answer("💵 Цена:")
+    await state.set_state(AdForm.price)
 
 @dp.message(AdForm.price)
 async def set_price(message: types.Message, state: FSMContext):
-    await state.update_data(price=message.text); await message.answer("📞 Контакт:"); await state.set_state(AdForm.contact)
+    await state.update_data(price=message.text)
+    await message.answer("📞 Контакт:")
+    await state.set_state(AdForm.contact)
 
 @dp.message(AdForm.contact)
 async def set_contact(message: types.Message, state: FSMContext):
-    await state.update_data(contact=message.text); await message.answer("📸 Скриншот:"); await state.set_state(AdForm.photo)
+    await state.update_data(contact=message.text)
+    await message.answer("📸 Скриншот (из игры):", reply_markup=skip_kb)
+    await state.set_state(AdForm.photo)
 
+# Обработка фото ИЛИ текста "Без фото"
 @dp.message(AdForm.photo)
-@dp.message(F.photo)
 async def process_photo(message: types.Message, state: FSMContext):
     p_id = message.photo[-1].file_id if message.photo else None
-    await state.update_data(photo=p_id); data = await state.get_data()
+    
+    # Если нажал кнопку "Без фото" или просто прислал текст - игнорируем текст, если это не кнопка пропуска
+    if message.text == "🚫 Без фото":
+        p_id = None
+    elif not message.photo:
+        return await message.answer("📸 Пожалуйста, отправьте фото или нажмите кнопку пропуска.")
+
+    await state.update_data(photo=p_id)
+    data = await state.get_data()
     txt = f"🧐 Проверка:\n━━━━━━━━━━━━━━━\nТовар: {data['item']}\nЦена: {data['price']}\nКонтакт: {data['contact']}"
-    if p_id: await message.answer_photo(p_id, caption=txt, reply_markup=confirm_kb, parse_mode="HTML")
-    else: await message.answer(txt, reply_markup=confirm_kb, parse_mode="HTML")
+    
+    if p_id: 
+        await message.answer_photo(p_id, caption=txt, reply_markup=confirm_kb, parse_mode="HTML")
+    else: 
+        await message.answer(txt, reply_markup=confirm_kb, parse_mode="HTML")
     await state.set_state(AdForm.confirm)
 
 @dp.callback_query(F.data == "final_send", AdForm.confirm)
 async def final_send(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data(); p_id = data.get('photo')
+    data = await state.get_data()
+    p_id = data.get('photo')
     txt = (f"📄 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n━━━━━━━━━━━━━━━\n"
            f"📦 Товар: {data['item']}\n💰 Цена: {data['price']}\n"
            f"📞 Контакт: {data['contact']}\n━━━━━━━━━━━━━━━\n"
            f"👤 Автор: <a href='tg://user?id={callback.from_user.id}'>Профиль</a>")
+    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"aprv_{callback.from_user.id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data="rej_")],
         [InlineKeyboardButton(text="⚠️ ВАРН", callback_data=f"warn_{callback.from_user.id}")]
     ])
+    
     for a_id in ADMIN_IDS:
         try:
             if p_id: await bot.send_photo(a_id, p_id, caption=txt, reply_markup=kb, parse_mode="HTML")
             else: await bot.send_message(a_id, txt, reply_markup=kb, parse_mode="HTML")
         except: pass
-    await callback.message.delete(); await callback.message.answer("⏳ На проверке!"); await state.clear()
+    
+    await callback.message.delete()
+    await callback.message.answer("⏳ Отправлено модераторам!", reply_markup=main_kb)
+    await state.clear()
 
 @dp.callback_query(F.data == "cancel_ad")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear(); await callback.message.delete(); await callback.message.answer("❌ Отмена.", reply_markup=main_kb)
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer("❌ Отменено.", reply_markup=main_kb)
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,), commit=True)
-    await state.clear(); await message.answer("👋 Привет!", reply_markup=main_kb)
+    await state.clear()
+    await message.answer("👋 Привет! Используйте кнопки меню.", reply_markup=main_kb)
 
 @dp.callback_query(F.data == "rej_")
-async def reject(callback: types.CallbackQuery): await callback.message.delete()
+async def reject(callback: types.CallbackQuery): 
+    await callback.message.delete()
 
 async def main():
     init_db()
