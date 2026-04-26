@@ -20,6 +20,9 @@ ADMIN_IDS = [571694385]
 CHANNEL_ID = -1003779573728
 DB_PATH = "bot_database.db"
 
+# Глобальный статус розыгрыша (в памяти)
+CURRENT_GIVEAWAY = {"active": False, "title": "", "desc": ""}
+
 # --- ИНИЦИАЛИЗАЦИЯ БД ---
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -27,6 +30,7 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS users 
                    (user_id INTEGER PRIMARY KEY, warns INTEGER DEFAULT 0, 
                     approved_ads INTEGER DEFAULT 0, ban_until REAL DEFAULT 0, ban_reason TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS giveaway (user_id INTEGER PRIMARY KEY)''')
     conn.commit()
     conn.close()
 
@@ -49,6 +53,10 @@ class AdForm(StatesGroup):
     photo = State()
     confirm = State() 
     waiting_for_warn_reason = State()
+    waiting_for_report_reason = State()
+    waiting_for_broadcast = State()
+    waiting_for_giveaway_title = State()
+    waiting_for_giveaway_desc = State()
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -57,6 +65,7 @@ dp = Dispatcher()
 # --- КЛАВИАТУРЫ ---
 main_kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="💰 Продать"), KeyboardButton(text="🛒 Купить")],
+    [KeyboardButton(text="🎁 Розыгрыш")],
     [KeyboardButton(text="👤 Мой профиль"), KeyboardButton(text="📜 Правила")]
 ], resize_keyboard=True)
 
@@ -65,13 +74,67 @@ cat_kb = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="👕 Скин/Аксессуар"), KeyboardButton(text="📦 Прочее")]
 ], resize_keyboard=True)
 
-# Кнопка для пропуска фото
 skip_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="🚫 Без фото")]], resize_keyboard=True)
 
 confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="✅ Отправить", callback_data="final_send")],
     [InlineKeyboardButton(text="❌ Сбросить", callback_data="cancel_ad")]
 ])
+
+# --- АДМИН КОМАНДЫ (STATS & BROADCAST) ---
+
+@dp.message(Command("stats"))
+async def show_stats(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        res = db_query("SELECT COUNT(*) FROM users", fetch=True)
+        await message.answer(f"📊 Всего пользователей в базе: {res[0][0]}")
+
+@dp.message(Command("broadcast"))
+async def start_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("📝 Введите текст рассылки для всех пользователей:")
+        await state.set_state(AdForm.waiting_for_broadcast)
+
+@dp.message(AdForm.waiting_for_broadcast)
+async def do_broadcast(message: types.Message, state: FSMContext):
+    users = db_query("SELECT user_id FROM users", fetch=True)
+    await message.answer(f"🚀 Начинаю рассылку на {len(users)} чел...")
+    for u in users:
+        try:
+            await bot.send_message(u[0], message.text)
+            await asyncio.sleep(0.05)
+        except: pass
+    await message.answer("✅ Готово!"); await state.clear()
+
+# --- ЛОГИКА ЖАЛОБ ---
+@dp.callback_query(F.data.startswith("rep_"))
+async def start_report(callback: types.CallbackQuery, state: FSMContext):
+    target_id = callback.data.split("_")[1]
+    await state.update_data(report_target=target_id)
+    await callback.message.answer("📝 Опишите причину жалобы (обман, цена, спам):")
+    await state.set_state(AdForm.waiting_for_report_reason)
+    await callback.answer()
+
+@dp.message(AdForm.waiting_for_report_reason)
+async def process_report(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    t_id = data.get('report_target')
+    
+    admin_txt = (f"🚩 <b>ЖАЛОБА</b>\n━━━━━━━━━━━━━━━\n"
+                 f"👤 Нарушитель: ID {t_id}\n"
+                 f"👤 Отправитель: ID {message.from_user.id}\n"
+                 f"📝 Причина: {message.text}")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ ВАРН", callback_data=f"warn_{t_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="rej_")]
+    ])
+    
+    for a_id in ADMIN_IDS:
+        try: await bot.send_message(a_id, admin_txt, reply_markup=kb, parse_mode="HTML")
+        except: pass
+    await message.answer("✅ Ваша жалоба отправлена модераторам.", reply_markup=main_kb)
+    await state.clear()
 
 # --- ЛОГИКА ВАРНОВ ---
 @dp.callback_query(F.data.startswith("warn_"))
@@ -86,7 +149,6 @@ async def start_warn(callback: types.CallbackQuery, state: FSMContext):
 async def process_warn(message: types.Message, state: FSMContext):
     data = await state.get_data()
     t_id = int(data['warn_target'])
-    db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (t_id,), commit=True)
     db_query("UPDATE users SET warns = warns + 1 WHERE user_id = ?", (t_id,), commit=True)
     res = db_query("SELECT warns FROM users WHERE user_id = ?", (t_id,), fetch=True)
     warns = res[0][0]
@@ -110,6 +172,7 @@ async def approve(callback: types.CallbackQuery):
     raw = callback.message.html_text if not callback.message.photo else callback.message.caption
     content = raw.split("━━━━━━━━━━━━━━━")[1].strip()
     full_text = f"📢 <b>ОБЪЯВЛЕНИЕ</b>\n\n{content}"
+    
     db_query("UPDATE users SET approved_ads = approved_ads + 1 WHERE user_id = ?", (u_id,), commit=True)
     photo_id = callback.message.photo[-1].file_id if callback.message.photo else None
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚩 Жалоба", callback_data=f"rep_{u_id}")]])
@@ -126,6 +189,7 @@ async def approve(callback: types.CallbackQuery):
         except: pass
     await callback.message.delete()
 
+# --- ПРОФИЛЬ ---
 @dp.message(F.text == "👤 Мой профиль")
 async def profile(message: types.Message):
     u_id = message.from_user.id
@@ -140,63 +204,84 @@ async def profile(message: types.Message):
         parse_mode="HTML", reply_markup=main_kb
     )
 
+# --- РОЗЫГРЫШИ ---
+@dp.message(F.text == "🎁 Розыгрыш")
+async def show_giveaway(message: types.Message):
+    if not CURRENT_GIVEAWAY["active"]: return await message.answer("😔 Сейчас нет активных розыгрышей.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Участвовать", callback_data="join_g")]])
+    await message.answer(f"🎉 <b>{CURRENT_GIVEAWAY['title']}</b>\n\n{CURRENT_GIVEAWAY['desc']}", reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "join_g")
+async def join_giveaway(callback: types.CallbackQuery):
+    u_id = callback.from_user.id
+    check = db_query("SELECT * FROM giveaway WHERE user_id = ?", (u_id,), fetch=True)
+    if check: return await callback.answer("⚠️ Вы уже участвуете!", show_alert=True)
+    db_query("INSERT INTO giveaway (user_id) VALUES (?)", (u_id,), commit=True)
+    await callback.answer("✅ Вы зарегистрированы!", show_alert=True)
+
+@dp.message(Command("new_giveaway"))
+async def new_giveaway_cmd(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        db_query("DELETE FROM giveaway", commit=True)
+        await message.answer("🏆 Название розыгрыша:"); await state.set_state(AdForm.waiting_for_giveaway_title)
+
+@dp.message(AdForm.waiting_for_giveaway_title)
+async def g_title(message: types.Message, state: FSMContext):
+    await state.update_data(gt=message.text); await message.answer("📝 Описание:"); await state.set_state(AdForm.waiting_for_giveaway_desc)
+
+@dp.message(AdForm.waiting_for_giveaway_desc)
+async def g_desc(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    CURRENT_GIVEAWAY.update({"active": True, "title": data['gt'], "desc": message.text})
+    await message.answer("✅ Розыгрыш запущен!"); await state.clear()
+
+@dp.message(Command("winner"))
+async def pick_winner(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        users = db_query("SELECT user_id FROM giveaway", fetch=True)
+        if not users: return await message.answer("❌ Участников нет.")
+        winner = random.choice(users)[0]
+        CURRENT_GIVEAWAY["active"] = False
+        await message.answer(f"🎊 Победитель: <a href='tg://user?id={winner}'>Ссылка</a>", parse_mode="HTML")
+
+# --- ПОДАЧА ОБЪЯВЛЕНИЯ ---
 @dp.message(F.text.in_(["💰 Продать", "🛒 Купить"]))
 async def start_ad(message: types.Message, state: FSMContext):
     res = db_query("SELECT ban_until FROM users WHERE user_id = ?", (message.from_user.id,), fetch=True)
-    if res and res[0][0] > time.time(): 
-        return await message.answer("🚫 Вы забанены.")
-    await message.answer("📁 Категория:", reply_markup=cat_kb)
-    await state.set_state(AdForm.category)
+    if res and res[0][0] > time.time(): return await message.answer("🚫 Вы забанены.")
+    await message.answer("📁 Категория:", reply_markup=cat_kb); await state.set_state(AdForm.category)
 
 @dp.message(AdForm.category)
 async def set_cat(message: types.Message, state: FSMContext):
-    await state.update_data(category=message.text)
-    await message.answer("📝 Описание (Товар, тюнинг):", reply_markup=ReplyKeyboardRemove())
-    await state.set_state(AdForm.item)
+    await state.update_data(category=message.text); await message.answer("📝 Описание:", reply_markup=ReplyKeyboardRemove()); await state.set_state(AdForm.item)
 
 @dp.message(AdForm.item)
 async def set_item(message: types.Message, state: FSMContext):
-    await state.update_data(item=message.text)
-    await message.answer("💵 Цена:")
-    await state.set_state(AdForm.price)
+    await state.update_data(item=message.text); await message.answer("💵 Цена:"); await state.set_state(AdForm.price)
 
 @dp.message(AdForm.price)
 async def set_price(message: types.Message, state: FSMContext):
-    await state.update_data(price=message.text)
-    await message.answer("📞 Контакт:")
-    await state.set_state(AdForm.contact)
+    await state.update_data(price=message.text); await message.answer("📞 Контакт:"); await state.set_state(AdForm.contact)
 
 @dp.message(AdForm.contact)
 async def set_contact(message: types.Message, state: FSMContext):
-    await state.update_data(contact=message.text)
-    await message.answer("📸 Скриншот (из игры):", reply_markup=skip_kb)
-    await state.set_state(AdForm.photo)
+    await state.update_data(contact=message.text); await message.answer("📸 Скриншот:", reply_markup=skip_kb); await state.set_state(AdForm.photo)
 
-# Обработка фото ИЛИ текста "Без фото"
 @dp.message(AdForm.photo)
 async def process_photo(message: types.Message, state: FSMContext):
     p_id = message.photo[-1].file_id if message.photo else None
+    if message.text != "🚫 Без фото" and not message.photo:
+        return await message.answer("📸 Отправьте фото или нажмите кнопку.")
     
-    # Если нажал кнопку "Без фото" или просто прислал текст - игнорируем текст, если это не кнопка пропуска
-    if message.text == "🚫 Без фото":
-        p_id = None
-    elif not message.photo:
-        return await message.answer("📸 Пожалуйста, отправьте фото или нажмите кнопку пропуска.")
-
-    await state.update_data(photo=p_id)
-    data = await state.get_data()
+    await state.update_data(photo=p_id); data = await state.get_data()
     txt = f"🧐 Проверка:\n━━━━━━━━━━━━━━━\nТовар: {data['item']}\nЦена: {data['price']}\nКонтакт: {data['contact']}"
-    
-    if p_id: 
-        await message.answer_photo(p_id, caption=txt, reply_markup=confirm_kb, parse_mode="HTML")
-    else: 
-        await message.answer(txt, reply_markup=confirm_kb, parse_mode="HTML")
+    if p_id: await message.answer_photo(p_id, caption=txt, reply_markup=confirm_kb, parse_mode="HTML")
+    else: await message.answer(txt, reply_markup=confirm_kb, parse_mode="HTML")
     await state.set_state(AdForm.confirm)
 
 @dp.callback_query(F.data == "final_send", AdForm.confirm)
 async def final_send(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    p_id = data.get('photo')
+    data = await state.get_data(); p_id = data.get('photo')
     txt = (f"📄 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n━━━━━━━━━━━━━━━\n"
            f"📦 Товар: {data['item']}\n💰 Цена: {data['price']}\n"
            f"📞 Контакт: {data['contact']}\n━━━━━━━━━━━━━━━\n"
@@ -207,32 +292,28 @@ async def final_send(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отклонить", callback_data="rej_")],
         [InlineKeyboardButton(text="⚠️ ВАРН", callback_data=f"warn_{callback.from_user.id}")]
     ])
-    
     for a_id in ADMIN_IDS:
         try:
             if p_id: await bot.send_photo(a_id, p_id, caption=txt, reply_markup=kb, parse_mode="HTML")
             else: await bot.send_message(a_id, txt, reply_markup=kb, parse_mode="HTML")
         except: pass
-    
-    await callback.message.delete()
-    await callback.message.answer("⏳ Отправлено модераторам!", reply_markup=main_kb)
-    await state.clear()
+    await callback.message.delete(); await callback.message.answer("⏳ На проверке!", reply_markup=main_kb); await state.clear()
 
 @dp.callback_query(F.data == "cancel_ad")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.delete()
-    await callback.message.answer("❌ Отменено.", reply_markup=main_kb)
+    await state.clear(); await callback.message.delete(); await callback.message.answer("❌ Отменено.", reply_markup=main_kb)
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,), commit=True)
-    await state.clear()
-    await message.answer("👋 Привет! Используйте кнопки меню.", reply_markup=main_kb)
+    await state.clear(); await message.answer("👋 Привет!", reply_markup=main_kb)
 
 @dp.callback_query(F.data == "rej_")
-async def reject(callback: types.CallbackQuery): 
-    await callback.message.delete()
+async def reject(callback: types.CallbackQuery): await callback.message.delete()
+
+@dp.message(F.text == "📜 Правила")
+async def rules(message: types.Message):
+    await message.answer("📝 <b>Правила:</b>\n1. Без спама.\n2. Реальные цены.\n3. Скрины из игры.", parse_mode="HTML")
 
 async def main():
     init_db()
