@@ -81,58 +81,51 @@ confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="❌ Сбросить", callback_data="cancel_ad")]
 ])
 
-# --- АДМИН КОМАНДЫ (STATS & BROADCAST) ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def get_report_kb(seller_id):
+    # ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЕ ИМЯ БОТА НИЖЕ
+    bot_username = "ТВОЙ_ЮЗЕРНЕЙМ_БОТА" 
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚩 Пожаловаться", url=f"https://t.me/{bot_username}?start=report_{seller_id}")]
+    ])
 
-@dp.message(Command("stats"))
-async def show_stats(message: types.Message):
-    if message.from_user.id in ADMIN_IDS:
-        res = db_query("SELECT COUNT(*) FROM users", fetch=True)
-        await message.answer(f"📊 Всего пользователей в базе: {res[0][0]}")
+# --- ОБРАБОТЧИК СТАРТА (С ЛОГИКОЙ ЖАЛОБ) ---
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message, state: FSMContext):
+    db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,), commit=True)
+    
+    # Проверка на Deep Linking (жалоба из канала)
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("report_"):
+        seller_id = args[1].split("_")[1]
+        await state.update_data(report_target=seller_id)
+        await message.answer(f"🚩 <b>Оформление жалобы</b>\n\nВы подаете жалобу на продавца ID: {seller_id}.\nОпишите причину (обман, спам, цена):", parse_mode="HTML")
+        await state.set_state(AdForm.waiting_for_report_reason)
+        return
 
-@dp.message(Command("broadcast"))
-async def start_broadcast(message: types.Message, state: FSMContext):
-    if message.from_user.id in ADMIN_IDS:
-        await message.answer("📝 Введите текст рассылки для всех пользователей:")
-        await state.set_state(AdForm.waiting_for_broadcast)
+    await state.clear()
+    await message.answer("👋 Добро пожаловать на торговую площадку 12 сервера!", reply_markup=main_kb)
 
-@dp.message(AdForm.waiting_for_broadcast)
-async def do_broadcast(message: types.Message, state: FSMContext):
-    users = db_query("SELECT user_id FROM users", fetch=True)
-    await message.answer(f"🚀 Начинаю рассылку на {len(users)} чел...")
-    for u in users:
-        try:
-            await bot.send_message(u[0], message.text)
-            await asyncio.sleep(0.05)
-        except: pass
-    await message.answer("✅ Готово!"); await state.clear()
-
-# --- ЛОГИКА ЖАЛОБ ---
-@dp.callback_query(F.data.startswith("rep_"))
-async def start_report(callback: types.CallbackQuery, state: FSMContext):
-    target_id = callback.data.split("_")[1]
-    await state.update_data(report_target=target_id)
-    await callback.message.answer("📝 Опишите причину жалобы (обман, цена, спам):")
-    await state.set_state(AdForm.waiting_for_report_reason)
-    await callback.answer()
-
+# --- ЛОГИКА ЖАЛОБ (ПРИЕМ ПРИЧИНЫ) ---
 @dp.message(AdForm.waiting_for_report_reason)
 async def process_report(message: types.Message, state: FSMContext):
     data = await state.get_data()
     t_id = data.get('report_target')
     
-    admin_txt = (f"🚩 <b>ЖАЛОБА</b>\n━━━━━━━━━━━━━━━\n"
-                 f"👤 Нарушитель: ID {t_id}\n"
-                 f"👤 Отправитель: ID {message.from_user.id}\n"
+    admin_txt = (f"🚩 <b>НОВАЯ ЖАЛОБА</b>\n━━━━━━━━━━━━━━━\n"
+                 f"👤 Нарушитель: ID <code>{t_id}</code>\n"
+                 f"👤 Отправитель: ID <code>{message.from_user.id}</code>\n"
                  f"📝 Причина: {message.text}")
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ ВАРН", callback_data=f"warn_{t_id}")],
+        [InlineKeyboardButton(text="⚠️ ВЫДАТЬ ВАРН", callback_data=f"warn_{t_id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data="rej_")]
     ])
     
     for a_id in ADMIN_IDS:
         try: await bot.send_message(a_id, admin_txt, reply_markup=kb, parse_mode="HTML")
         except: pass
+        
     await message.answer("✅ Ваша жалоба отправлена модераторам.", reply_markup=main_kb)
     await state.clear()
 
@@ -175,7 +168,9 @@ async def approve(callback: types.CallbackQuery):
     
     db_query("UPDATE users SET approved_ads = approved_ads + 1 WHERE user_id = ?", (u_id,), commit=True)
     photo_id = callback.message.photo[-1].file_id if callback.message.photo else None
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🚩 Жалоба", callback_data=f"rep_{u_id}")]])
+    
+    # Кнопка жалобы теперь ведет в личку бота
+    kb = get_report_kb(u_id)
 
     if photo_id: await bot.send_photo(CHANNEL_ID, photo_id, caption=full_text, parse_mode="HTML", reply_markup=kb)
     else: await bot.send_message(CHANNEL_ID, full_text, parse_mode="HTML", reply_markup=kb)
@@ -199,10 +194,27 @@ async def profile(message: types.Message):
         res = [(0,0,0)]
     warns, approved, b_until = res[0]
     status = "🟢 Активен" if b_until < time.time() else "🔴 ЗАБАНЕН"
-    await message.answer(
-        f"👤 <b>ПРОФИЛЬ</b>\n━━━━━━━━━━━━━━━\nID: <code>{u_id}</code>\nСтатус: {status}\nВарны: {warns}/3\nСделок: {approved}", 
-        parse_mode="HTML", reply_markup=main_kb
-    )
+    await message.answer(f"👤 <b>ПРОФИЛЬ</b>\n━━━━━━━━━━━━━━━\nID: <code>{u_id}</code>\nСтатус: {status}\nВарны: {warns}/3\nСделок: {approved}", parse_mode="HTML", reply_markup=main_kb)
+
+# --- АДМИН-КОМАНДЫ (STATS & BROADCAST) ---
+@dp.message(Command("stats"))
+async def show_stats(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        res = db_query("SELECT COUNT(*) FROM users", fetch=True)
+        await message.answer(f"📊 Всего пользователей: {res[0][0]}")
+
+@dp.message(Command("broadcast"))
+async def start_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("📝 Текст рассылки:"); await state.set_state(AdForm.waiting_for_broadcast)
+
+@dp.message(AdForm.waiting_for_broadcast)
+async def do_broadcast(message: types.Message, state: FSMContext):
+    users = db_query("SELECT user_id FROM users", fetch=True)
+    for u in users:
+        try: await bot.send_message(u[0], message.text); await asyncio.sleep(0.05)
+        except: pass
+    await message.answer("✅ Готово!"); await state.clear()
 
 # --- РОЗЫГРЫШИ ---
 @dp.message(F.text == "🎁 Розыгрыш")
@@ -223,7 +235,7 @@ async def join_giveaway(callback: types.CallbackQuery):
 async def new_giveaway_cmd(message: types.Message, state: FSMContext):
     if message.from_user.id in ADMIN_IDS:
         db_query("DELETE FROM giveaway", commit=True)
-        await message.answer("🏆 Название розыгрыша:"); await state.set_state(AdForm.waiting_for_giveaway_title)
+        await message.answer("🏆 Название:"); await state.set_state(AdForm.waiting_for_giveaway_title)
 
 @dp.message(AdForm.waiting_for_giveaway_title)
 async def g_title(message: types.Message, state: FSMContext):
@@ -302,11 +314,6 @@ async def final_send(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "cancel_ad")
 async def cancel(callback: types.CallbackQuery, state: FSMContext):
     await state.clear(); await callback.message.delete(); await callback.message.answer("❌ Отменено.", reply_markup=main_kb)
-
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
-    db_query("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,), commit=True)
-    await state.clear(); await message.answer("👋 Привет!", reply_markup=main_kb)
 
 @dp.callback_query(F.data == "rej_")
 async def reject(callback: types.CallbackQuery): await callback.message.delete()
