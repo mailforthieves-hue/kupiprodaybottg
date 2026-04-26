@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import os
+import random
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import State, StatesGroup
@@ -24,6 +25,7 @@ CHANNEL_ID = -1003779573728
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 USERS_FILE = os.path.join(BASE_DIR, "users.txt")
 BAN_FILE = os.path.join(BASE_DIR, "banlist.txt")
+GIVEAWAY_USERS = os.path.join(BASE_DIR, "giveaway_users.txt")
 
 # --- ФАЙЛЫ ---
 def load_data(file_path):
@@ -55,6 +57,9 @@ class AdForm(StatesGroup):
     photo = State()
     confirm = State() 
     waiting_for_broadcast = State()
+    # Состояния для розыгрыша
+    waiting_for_giveaway_title = State()
+    waiting_for_giveaway_desc = State()
 
 # --- КЛАВИАТУРЫ ---
 main_kb = ReplyKeyboardMarkup(keyboard=[
@@ -74,10 +79,14 @@ confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="❌ Сбросить", callback_data="cancel_ad")]
 ])
 
+def get_giveaway_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Принять участие", callback_data="participate_giveaway")]
+    ])
+
 # --- ОТПРАВКА АДМИНАМ ---
 async def send_to_admins(data, user_id):
     photo_id = data.get('photo')
-
     text = (f"📄 <b>НОВОЕ ОБЪЯВЛЕНИЕ</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📦 <b>Товар:</b> {data['item']}\n"
@@ -102,13 +111,84 @@ async def send_to_admins(data, user_id):
         except Exception as e:
             logging.error(f"Ошибка админки: {e}")
 
-# --- ОБРАБОТЧИКИ ---
+# --- ОБРАБОТЧИКИ АДМИН-КОМАНД ---
 
 @dp.message(Command("stats"))
 async def show_stats(message: types.Message):
     if message.from_user.id in ADMIN_IDS:
         count = len(load_data(USERS_FILE))
         await message.answer(f"📊 Пользователей в базе: {count}")
+
+@dp.message(Command("broadcast"))
+async def start_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer("📝 Введите текст для рассылки всем пользователям:")
+        await state.set_state(AdForm.waiting_for_broadcast)
+
+@dp.message(AdForm.waiting_for_broadcast)
+async def do_broadcast(message: types.Message, state: FSMContext):
+    users = load_data(USERS_FILE)
+    await message.answer(f"🚀 Начинаю рассылку на {len(users)} чел...")
+    for u_id in users:
+        try:
+            await bot.send_message(u_id, message.text)
+            await asyncio.sleep(0.05)
+        except: pass
+    await message.answer("✅ Готово!")
+    await state.clear()
+
+# --- ЛОГИКА РОЗЫГРЫШЕЙ ---
+
+@dp.message(Command("new_giveaway"))
+async def start_giveaway(message: types.Message, state: FSMContext):
+    if message.from_user.id in ADMIN_IDS:
+        if os.path.exists(GIVEAWAY_USERS): os.remove(GIVEAWAY_USERS)
+        await message.answer("🏆 Введите НАЗВАНИЕ розыгрыша:")
+        await state.set_state(AdForm.waiting_for_giveaway_title)
+
+@dp.message(AdForm.waiting_for_giveaway_title)
+async def set_g_title(message: types.Message, state: FSMContext):
+    await state.update_data(g_title=message.text)
+    await message.answer("📝 Введите УСЛОВИЯ и описание розыгрыша:")
+    await state.set_state(AdForm.waiting_for_giveaway_desc)
+
+@dp.message(AdForm.waiting_for_giveaway_desc)
+async def confirm_g(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    title = data['g_title']
+    desc = message.text
+    users = load_data(USERS_FILE)
+    
+    text = f"🎉 <b>НОВЫЙ РОЗЫГРЫШ: {title}</b>\n\n{desc}"
+    await message.answer(f"🚀 Рассылаю розыгрыш {len(users)} пользователям...")
+    
+    for u_id in users:
+        try:
+            await bot.send_message(u_id, text, reply_markup=get_giveaway_kb(), parse_mode="HTML")
+            await asyncio.sleep(0.05)
+        except: pass
+    await state.clear()
+    await message.answer("✅ Розыгрыш запущен!")
+
+@dp.callback_query(F.data == "participate_giveaway")
+async def participate(callback: types.CallbackQuery):
+    u_id = str(callback.from_user.id)
+    participants = load_data(GIVEAWAY_USERS)
+    if u_id in participants:
+        await callback.answer("⚠️ Вы уже участвуете!", show_alert=True)
+    else:
+        save_data(GIVEAWAY_USERS, u_id)
+        await callback.answer("✅ Вы успешно зарегистрированы!", show_alert=True)
+
+@dp.message(Command("winner"))
+async def choose_winner(message: types.Message):
+    if message.from_user.id in ADMIN_IDS:
+        participants = list(load_data(GIVEAWAY_USERS))
+        if not participants: return await message.answer("❌ Участников нет.")
+        winner = random.choice(participants)
+        await message.answer(f"🎊 Победитель: <code>{winner}</code>\n<a href='tg://user?id={winner}'>Профиль</a>", parse_mode="HTML")
+
+# --- БАЗОВЫЕ ОБРАБОТЧИКИ ---
 
 @dp.message(CommandStart())
 @dp.message(F.text == "📜 Правила")
@@ -151,10 +231,7 @@ async def set_item(message: types.Message, state: FSMContext):
 async def set_price(message: types.Message, state: FSMContext):
     await state.update_data(price=message.text)
     user_nick = f"@{message.from_user.username}" if message.from_user.username else ""
-    await message.answer(
-        f"📞 <b>Как с вами связаться?</b>\n\nВведите ник (например, {user_nick}) или номер телефона.",
-        parse_mode="HTML"
-    )
+    await message.answer(f"📞 <b>Как с вами связаться?</b>\n\nВведите ник (например, {user_nick}) или номер телефона.", parse_mode="HTML")
     await state.set_state(AdForm.contact)
 
 @dp.message(AdForm.contact)
@@ -167,23 +244,17 @@ async def set_contact(message: types.Message, state: FSMContext):
 @dp.message(F.photo)
 async def process_photo_preview(message: types.Message, state: FSMContext):
     photo_id = message.photo[-1].file_id if message.photo else None
-
     if not message.photo and message.text != "🚫 Без фото":
         return await message.answer("⚠️ Используйте кнопку или отправьте фото.")
     
     await state.update_data(photo=photo_id)
     data = await state.get_data()
-
-    text = (f"🧐 <b>Проверьте объявление:</b>\n\n"
-            f"Товар: {data['item']}\n"
-            f"Цена: {data['price']}\n"
-            f"Контакт: {data['contact']}")
+    text = (f"🧐 <b>Проверьте объявление:</b>\n\nТовар: {data['item']}\nЦена: {data['price']}\nКонтакт: {data['contact']}")
     
     if photo_id:
         await message.answer_photo(photo_id, caption=text, reply_markup=confirm_kb, parse_mode="HTML")
     else:
         await message.answer(text, reply_markup=confirm_kb, parse_mode="HTML")
-
     await state.set_state(AdForm.confirm)
 
 @dp.callback_query(F.data == "final_send", AdForm.confirm)
@@ -200,43 +271,26 @@ async def approve(callback: types.CallbackQuery):
     try:
         u_id = callback.data.split("_")[1]
         raw = callback.message.html_text if not callback.message.photo else callback.message.caption
-        
         content = raw.split("━━━━━━━━━━━━━━━")[1].strip()
         header = "📢 <b>ОБЪЯВЛЕНИЕ</b>"
         
         if callback.message.photo:
-            await bot.send_photo(
-                CHANNEL_ID,
-                callback.message.photo[-1].file_id,
-                caption=f"{header}\n\n{content}",
-                parse_mode="HTML"
-            )
+            await bot.send_photo(CHANNEL_ID, callback.message.photo[-1].file_id, caption=f"{header}\n\n{content}", parse_mode="HTML")
         else:
-            await bot.send_message(
-                CHANNEL_ID,
-                f"{header}\n\n{content}",
-                parse_mode="HTML"
-            )
+            await bot.send_message(CHANNEL_ID, f"{header}\n\n{content}", parse_mode="HTML")
         
-        try:
-            await bot.send_message(u_id, "✅ Ваше объявление опубликовано!")
-        except:
-            pass
-
+        try: await bot.send_message(u_id, "✅ Ваше объявление опубликовано!")
+        except: pass
         await callback.message.delete()
         await callback.answer("Опубликовано!")
-
     except Exception as e:
-        logging.error(f"Ошибка публикации: {e}")
         await callback.answer(f"Ошибка: {e}", show_alert=True)
 
 @dp.callback_query(F.data.startswith("rej_"))
 async def reject(callback: types.CallbackQuery):
     u_id = callback.data.split("_")[1]
-    try:
-        await bot.send_message(u_id, "❌ Объявление отклонено.")
-    except:
-        pass
+    try: await bot.send_message(u_id, "❌ Объявление отклонено.")
+    except: pass
     await callback.message.delete()
 
 @dp.callback_query(F.data.startswith("ban_"))
