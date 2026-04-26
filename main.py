@@ -139,7 +139,7 @@ async def do_broadcast(message: types.Message, state: FSMContext):
     await message.answer("✅ Готово!")
     await state.clear()
 
-# --- ЛОГИКА ОДОБРЕНИЯ ОБЪЯВЛЕНИЙ (С БРОАДКАСТОМ) ---
+# --- ЛОГИКА ОДОБРЕНИЯ ОБЪЯВЛЕНИЙ ---
 @dp.callback_query(F.data.startswith("aprv_"))
 async def approve(callback: types.CallbackQuery):
     try:
@@ -284,6 +284,13 @@ async def process_photo_preview(message: types.Message, state: FSMContext):
     if photo_id: await message.answer_photo(photo_id, caption=text, reply_markup=confirm_kb, parse_mode="HTML")
     else: await message.answer(text, reply_markup=confirm_kb, parse_mode="HTML")
     await state.set_state(AdForm.confirm)
+
+# Обработчик кнопки "❌ Сбросить" (ОТМЕНА)
+@dp.callback_query(F.data == "cancel_ad")
+async def cancel_ad(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.delete()
+    await callback.message.answer("❌ Объявление отменено.", reply_markup=main_kb)
 
 @dp.callback_query(F.data == "final_send", AdForm.confirm)
 async def final_process(callback: types.CallbackQuery, state: FSMContext):
