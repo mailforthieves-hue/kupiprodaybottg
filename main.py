@@ -16,7 +16,7 @@ from aiogram.types import (
 
 # --- НАСТРОЙКИ ---
 TOKEN = os.getenv("TOKEN")
-ADMIN_IDS = [571694385] 
+ADMIN_IDS = [571694385,718488418] 
 CHANNEL_ID = -1003779573728
 DB_PATH = "bot_database.db"
 
